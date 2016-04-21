@@ -40,10 +40,8 @@ MODULE_LICENSE("GPL");
 
 /* parameters */
 static int sleepy_ndevices = SLEEPY_NDEVICES;
-
-static int INPUT_COUNT = 4;
-static volatile int32_t  waked[SLEEPY_NDEVICES] = {0};
-static wait_queue_head_t queue[SLEEPY_NDEVICES];
+static volatile s32     gWakeFlag[SLEEPY_NDEVICES] = {0};
+static wait_queue_head_t gWaitQueue[SLEEPY_NDEVICES];
 
 module_param(sleepy_ndevices, int, S_IRUGO);
 /* ================================================================ */
@@ -93,29 +91,30 @@ sleepy_read(struct file *filp, char __user *buf, size_t count,
 loff_t *f_pos)
 {
 struct sleepy_dev *dev = (struct sleepy_dev *)filp->private_data;
-ssize_t retval = 0;
-int minor;
+ssize_t retval = OK;
+int minor = (int)iminor(filp->f_path.dentry->d_inode);
 
 if (mutex_lock_killable(&dev->sleepy_mutex))
 return -EINTR;
 
 /* YOUR CODE HERE */
-minor = (int)iminor(filp->f_path.dentry->d_inode);
-printk("read device %d\n", minor);
-
-if(0 == waitqueue_active(&queue[minor]))
+printk("SLEEPY_READ DEVICE (%d): Process is waking everyone up. \n", minor);
+if(OK == waitqueue_active(&gWaitQueue[minor]))
 {
-printk("empty waiting queue\n");
-mutex_unlock(&dev->sleepy_mutex);
-return 0;
+// printk(KERN_DEBUG "Nothing in the waiting queue, exit\n");
+goto EXIT_LOCK;
 }
 
-waked[minor]=1;
-wake_up_interruptible(&queue[minor]);
+gWakeFlag[minor] = 1;
+wake_up_interruptible(&gWaitQueue[minor]);
 retval = copy_to_user(buf, dev->data, count);
-
+if(OK != retval)
+{
+printk(KERN_WARNING "Copy to user space failed\n");
+}
 /* END YOUR CODE */
 
+EXIT_LOCK:
 mutex_unlock(&dev->sleepy_mutex);
 return retval;
 }
@@ -125,59 +124,59 @@ sleepy_write(struct file *filp, const char __user *buf, size_t count,
 loff_t *f_pos)
 {
 struct sleepy_dev *dev = (struct sleepy_dev *)filp->private_data;
-ssize_t retval = 0;
-int elapse;
-int minor;
-unsigned long timeout;
-unsigned long begtime;
+ssize_t retval = OK;
+s64 timeout = 0;
+s64 start_time = jiffies;
+int minor = (int)iminor(filp->f_path.dentry->d_inode);
 
 if (mutex_lock_killable(&dev->sleepy_mutex))
 return -EINTR;
 
 /* YOUR CODE HERE */
-if(count != INPUT_COUNT)
+if(COUNT_NUM != count)
 {
-printk("input should be 4 bytes integer\n");
-mutex_unlock(&dev->sleepy_mutex);
-return -EINVAL;
+printk(KERN_WARNING "Please input 4 bytes integer\n");
+retval = -EINVAL;
+goto EXIT_LOCK;
 }
 
-if(0 != (retval = copy_from_user(dev->data, buf, count)))
+retval = copy_from_user(dev->data, buf, count);
+if(OK != retval)
 {
-printk("get data from user space failed");
-mutex_unlock(&dev->sleepy_mutex);
-return retval;
+printk(KERN_WARNING "Copy to kernel space failed, error code: %d\n", (int)retval);
+goto EXIT_LOCK;
 }
 
-elapse = *(int*)dev->data;
-if(elapse<0)
+timeout = *(int*)dev->data;
+//printk(KERN_DEBUG "Rcvd time: %lld, len: %zd\n", timeout, count);
+if(0 > timeout)
 {
-printk("negative wait time will not sleep\n");
-mutex_unlock(&dev->sleepy_mutex);
-return 0;
+printk(KERN_WARNING "Negative number or None-number input, no sleep is performed\n");
+goto EXIT_LOCK;
 }
 
-minor = (int)iminor(filp->f_path.dentry->d_inode);
-waked[minor] = 0;
-
-timeout = elapse*HZ;
-begtime = jiffies;
-
+timeout *= HZ;
+printk(KERN_DEBUG "sleep %i (%s) in queue /dev/sleepy%d\n", current->pid, current->comm, minor);
+gWakeFlag[minor] = 0;
 mutex_unlock(&dev->sleepy_mutex);
 
-retval = wait_event_interruptible_timeout(queue[minor], waked[minor]==1, timeout);
-if(0 != retval)
+retval = wait_event_interruptible_timeout(gWaitQueue[minor], 0 != gWakeFlag[minor], timeout);
+if(OK > retval)
 {
-printk("wait error\n");
-return retval;
+printk(KERN_WARNING "Wait event time error\n");
+goto EXIT_NOLOCK;
 }
+retval = OK;
 
-mutex_unlock(&dev->sleepy_mutex);
-retval = (begtime+timeout-jiffies)/HZ;
-printk("remaining time:%zd", retval);
+mutex_lock(&dev->sleepy_mutex);
+retval = (start_time + timeout - jiffies) / HZ;
+printk("SLEEPY_WRITE DEVICE (%d): remaining = %zd \n", minor, retval);
+
 /* END YOUR CODE */
 
+EXIT_LOCK:
 mutex_unlock(&dev->sleepy_mutex);
+EXIT_NOLOCK:
 return retval;
 }
 
@@ -213,13 +212,6 @@ BUG_ON(dev == NULL || class == NULL);
 
 /* Memory is to be allocated when the device is opened the first time */
 dev->data = NULL;
-dev->data = (char*)kzalloc(INPUT_COUNT*sizeof(char), GFP_KERNEL);
-if(dev->data == NULL)
-{
-printk("allocated memory failed\n");
-return err;
-}
-
 mutex_init(&dev->sleepy_mutex);
 
 cdev_init(&dev->cdev, &sleepy_fops);
@@ -244,6 +236,14 @@ err, SLEEPY_DEVICE_NAME, minor);
 cdev_del(&dev->cdev);
 return err;
 }
+
+dev->data = (char*)kzalloc(COUNT_NUM * sizeof(char), GFP_KERNEL);
+if(NULL == dev->data)
+{
+printk(KERN_WARNING "Allocate data failed\n");
+return NOK;
+}
+
 return 0;
 }
 
@@ -329,6 +329,7 @@ if (err) {
 devices_to_destroy = i;
 goto fail;
 }
+init_waitqueue_head(&gWaitQueue[i]);
 }
 
 printk ("sleepy module loaded\n");
